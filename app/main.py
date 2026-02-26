@@ -19,6 +19,30 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 app = FastAPI()
 db_pool: Optional[asyncpg.pool.Pool] = None
 
+
+# helpers for timing queries
+async def timed_fetchrow(conn, query, *args):
+    start = time.time()
+    row = await conn.fetchrow(query, *args)
+    duration_ms = int((time.time() - start) * 1000)
+    logger.info("db_query", extra={"query": query, "duration_ms": duration_ms})
+    return row
+
+async def timed_fetchval(conn, query, *args):
+    start = time.time()
+    val = await conn.fetchval(query, *args)
+    duration_ms = int((time.time() - start) * 1000)
+    logger.info("db_query", extra={"query": query, "duration_ms": duration_ms})
+    return val
+
+async def timed_execute(conn, query, *args):
+    start = time.time()
+    result = await conn.execute(query, *args)
+    duration_ms = int((time.time() - start) * 1000)
+    logger.info("db_query", extra={"query": query, "duration_ms": duration_ms})
+    return result
+
+
 # Configure structured JSON logging
 logger = logging.getLogger("inventory")
 if not logger.handlers:
@@ -83,7 +107,7 @@ async def reset_products():
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             # Reset to known initial values
-            await conn.execute("UPDATE products SET stock = CASE WHEN name = 'Super Widget' THEN 100 WHEN name = 'Mega Gadget' THEN 50 ELSE stock END, version = 1;")
+            await timed_execute(conn, "UPDATE products SET stock = CASE WHEN name = 'Super Widget' THEN 100 WHEN name = 'Mega Gadget' THEN 50 ELSE stock END, version = 1;")
     logger.info("products_reset", extra={})
     return {"message": "Product inventory reset successfully."}
 
@@ -91,7 +115,7 @@ async def reset_products():
 @app.get("/api/products/{product_id}")
 async def get_product(product_id: int):
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id, name, stock, version FROM products WHERE id = $1", product_id)
+        row = await timed_fetchrow(conn, "SELECT id, name, stock, version FROM products WHERE id = $1", product_id)
         if not row:
             raise HTTPException(status_code=404, detail="Product not found")
         return dict(row)
@@ -106,7 +130,7 @@ async def create_order_pessimistic(req: OrderRequest):
                 await conn.execute(f"SET LOCAL lock_timeout = '{PESSIMISTIC_LOCK_TIMEOUT_MS}ms'")
                 # acquire row lock
                 logger.info("pessimistic_lock_acquire_attempt", extra={"productId": req.productId, "userId": req.userId})
-                row = await conn.fetchrow("SELECT id, stock FROM products WHERE id = $1 FOR UPDATE", req.productId)
+                row = await timed_fetchrow(conn, "SELECT id, stock FROM products WHERE id = $1 FOR UPDATE", req.productId)
                 if not row:
                     raise HTTPException(status_code=404, detail="Product not found")
                 if row["stock"] < req.quantity:
@@ -122,8 +146,9 @@ async def create_order_pessimistic(req: OrderRequest):
                     raise HTTPException(status_code=400, detail="Insufficient stock")
 
                 # update stock and insert order
-                await conn.execute("UPDATE products SET stock = stock - $1 WHERE id = $2", req.quantity, req.productId)
-                res = await conn.fetchrow(
+                await timed_execute(conn, "UPDATE products SET stock = stock - $1 WHERE id = $2", req.quantity, req.productId)
+                res = await timed_fetchrow(
+                    conn,
                     "INSERT INTO orders (product_id, quantity_ordered, user_id, status) VALUES ($1,$2,$3,$4) RETURNING id, status, created_at",
                     req.productId,
                     req.quantity,
@@ -146,7 +171,7 @@ async def create_order_optimistic(req: OrderRequest):
             attempt += 1
             logger.info("optimistic_attempt", extra={"attempt": attempt, "productId": req.productId, "userId": req.userId})
             async with conn.transaction():
-                row = await conn.fetchrow("SELECT id, stock, version FROM products WHERE id = $1", req.productId)
+                row = await timed_fetchrow(conn, "SELECT id, stock, version FROM products WHERE id = $1", req.productId)
                 if not row:
                     raise HTTPException(status_code=404, detail="Product not found")
                 if row["stock"] < req.quantity:
@@ -161,7 +186,8 @@ async def create_order_optimistic(req: OrderRequest):
                     raise HTTPException(status_code=400, detail="Insufficient stock")
 
                 # attempt optimistic update
-                result = await conn.execute(
+                result = await timed_execute(
+                    conn,
                     "UPDATE products SET stock = stock - $1, version = version + 1 WHERE id = $2 AND version = $3 AND stock >= $1",
                     req.quantity,
                     req.productId,
@@ -170,7 +196,8 @@ async def create_order_optimistic(req: OrderRequest):
                 # asyncpg returns command tag like 'UPDATE 1' or 'UPDATE 0'
                 updated = int(result.split()[1]) if len(result.split()) > 1 else 0
                 if updated == 1:
-                    r = await conn.fetchrow(
+                    r = await timed_fetchrow(
+                        conn,
                         "INSERT INTO orders (product_id, quantity_ordered, user_id, status) VALUES ($1,$2,$3,$4) RETURNING id, status, created_at",
                         req.productId,
                         req.quantity,
@@ -188,7 +215,8 @@ async def create_order_optimistic(req: OrderRequest):
 
         # If we reach here, retries exhausted
         async with conn.transaction():
-            await conn.execute(
+            await timed_execute(
+                conn,
                 "INSERT INTO orders (product_id, quantity_ordered, user_id, status) VALUES ($1,$2,$3,$4)",
                 req.productId,
                 req.quantity,
@@ -199,25 +227,25 @@ async def create_order_optimistic(req: OrderRequest):
         raise HTTPException(status_code=409, detail="Conflict after retries")
 
 
-@app.get("/api/orders/{order_id}")
-async def get_order(order_id: int):
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT id, product_id, quantity_ordered, user_id, status, created_at FROM orders WHERE id = $1", order_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Order not found")
-        return dict(row)
-
-
 @app.get("/api/orders/stats")
 async def orders_stats():
     async with db_pool.acquire() as conn:
-        total = await conn.fetchval("SELECT COUNT(*) FROM orders")
-        success = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'SUCCESS'")
-        failed_oos = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'FAILED_OUT_OF_STOCK'")
-        failed_conflict = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE status = 'FAILED_CONFLICT'")
+        total = await timed_fetchval(conn, "SELECT COUNT(*) FROM orders")
+        success = await timed_fetchval(conn, "SELECT COUNT(*) FROM orders WHERE status = 'SUCCESS'")
+        failed_oos = await timed_fetchval(conn, "SELECT COUNT(*) FROM orders WHERE status = 'FAILED_OUT_OF_STOCK'")
+        failed_conflict = await timed_fetchval(conn, "SELECT COUNT(*) FROM orders WHERE status = 'FAILED_CONFLICT'")
         return {
             "totalOrders": int(total),
             "successfulOrders": int(success),
             "failedOutOfStock": int(failed_oos),
             "failedConflict": int(failed_conflict),
         }
+
+
+@app.get("/api/orders/{order_id:int}")
+async def get_order(order_id: int):
+    async with db_pool.acquire() as conn:
+        row = await timed_fetchrow(conn, "SELECT id, product_id, quantity_ordered, user_id, status, created_at FROM orders WHERE id = $1", order_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        return dict(row)
