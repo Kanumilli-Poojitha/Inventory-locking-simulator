@@ -37,3 +37,4 @@ Notes
 
 - The pessimistic endpoint uses `SELECT ... FOR UPDATE` and a configurable `lock_timeout`.
 - The optimistic endpoint uses a `version` column and retries with exponential backoff.
+- All database queries and HTTP requests are logged with structured JSON; DB ops include timing metrics to help analyze latency.
