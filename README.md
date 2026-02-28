@@ -38,3 +38,37 @@ Notes
 - The pessimistic endpoint uses `SELECT ... FOR UPDATE` and a configurable `lock_timeout`.
 - The optimistic endpoint uses a `version` column and retries with exponential backoff.
 - All database queries and HTTP requests are logged with structured JSON; DB ops include timing metrics to help analyze latency.
+
+live demo:
+
+https://drive.google.com/file/d/1dcxBWdFmuB_vv4yltYUL7qDF93yaW50s/view?usp=sharing
+
+demo video:
+
+https://drive.google.com/file/d/1tJhGyyaFuEL33yGn0Eou9xRTYIyRfl8u/view?usp=sharing
+
+
+commands used in live demo:
+
+docker-compose up --build -d
+
+docker ps
+
+curl.exe http://localhost:8080/health
+
+curl.exe -X POST http://localhost:8080/api/products/reset
+
+curl.exe http://localhost:8080/api/products/1
+
+bash concurrent-test.sh pessimistic
+
+curl.exe http://localhost:8080/api/orders/stats
+
+bash concurrent-test.sh optimistic
+
+curl.exe http://localhost:8080/api/orders/stats
+
+curl.exe http://localhost:8080/api/orders/1
+
+Author:
+Poojitha Kanumilli
